@@ -1,0 +1,13 @@
+# Ignore data
+crimes-reduced.csv
+data/
+
+# Ignore Census API credentials
+.Renviron
+
+# Ignore R temporary files
+.Rhistory
+.RData
+.Ruserdata
+.Rproj.user/
+
