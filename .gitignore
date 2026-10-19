@@ -1,13 +1,14 @@
-# Ignore data
-crimes-reduced.csv
+# Data files
 data/
 
-# Ignore Census API credentials
+# Census API credentials
 .Renviron
 
-# Ignore R temporary files
+# RStudio files
 .Rhistory
 .RData
 .Ruserdata
 .Rproj.user/
 
+# Mac system files
+.DS_Store

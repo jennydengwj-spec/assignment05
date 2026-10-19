@@ -1,26 +1,552 @@
 ---
-title: "Untitled"
-format: html
-editor: visual
+title: "Assignment 05: Chicago Homicide Analysis"
+author: "Wenjie Deng"
+format:
+  html:
+    embed-resources: true
+    toc: true
+execute:
+  echo: true
+  message: false
+  warning: false
 ---
-
-## Quarto
-
-Quarto enables you to weave together content and executable code into a finished document. To learn more about Quarto see <https://quarto.org>.
-
-## Running Code
-
-When you click the **Render** button a document will be generated that includes both content and the output of embedded code. You can embed code like this:
-
+## Setup: Load packages
 ```{r}
-1 + 1
+library(tidyverse)
+library(sf)
+library(tidycensus)
+library(purrr)
+library(httr)
+library(jsonlite)
+library(testthat)
+options(tigris_use_cache = TRUE)
 ```
 
-You can add options to executable code like this
-
+## 1. Data Loading & Cleaning (1 Point)
 ```{r}
-#| echo: false
-2 * 2
+library(tidyverse)
+
+crimes <- read_csv(
+  "data/crimes-reduced.csv",
+  col_types = cols(
+    Longitude = col_character(),
+    Latitude = col_character(),
+    .default = col_guess()
+  )
+)
+
+names(crimes) <- names(crimes) |>
+  str_replace_all("\\s+", "_") |>
+  str_to_lower()
+
+glimpse(crimes)
+```
+## 2. Filtering the data to homicides within ten years of today (1 Point)
+```{r}
+library(lubridate)
+
+crimes_lim <- crimes |>
+  mutate(date = mdy_hms(date)) |>
+  filter(
+    primary_type == "HOMICIDE",
+    !is.na(latitude),
+    !is.na(longitude),
+    as_date(date) >= today() %m-% years(10),
+    as_date(date) <= today()
+  )
+
+
+nrow(crimes_lim)
+
+table(year(crimes_lim$date))
+
+min(crimes_lim$date)
+```
+## 3. Convert Lon/Lat to Points Geometry (1 Point)
+```{r}
+library(sf)
+
+crimes_lim <- crimes_lim |>
+  mutate(
+    longitude = as.numeric(longitude),
+    latitude = as.numeric(latitude)
+  )
+
+crimes_sf <- crimes_lim |>
+  st_as_sf(
+    coords = c("longitude", "latitude"),
+    crs = 4326,
+    remove = FALSE
+  )
+
+st_crs(crimes_sf)
+
+ggplot(crimes_sf) +
+  geom_sf(aes(color = arrest), size = 0.5, alpha = 0.6) +
+  labs(
+    title = "Homicides in Chicago",
+    subtitle = "Homicide incidents within the past ten years",
+    color = "Arrest"
+  ) +
+  theme_minimal()
+```
+## 4. Load Census Tracts, Perform a Spatial Join, and Create Choropleth (1.5 points)
+```{r}
+library(sf)
+library(tidyverse)
+
+chicago_tracts <- st_read(
+  "data/geo_export_843321ed-c5db-4ed4-a750-7f48c61a9bde.shp"
+) |>
+  select(geoid10, geometry)
+chicago_tracts <- chicago_tracts |>
+  st_transform(4326)
+crimes_joined <- crimes_sf |>
+  st_join(chicago_tracts, join = st_within)
+
+chicago_merged_agg <- crimes_joined |>
+  st_drop_geometry() |>
+  filter(!is.na(geoid10)) |>
+  group_by(geoid10) |>
+  summarise(
+    count = n(),
+    arrest_rate = mean(arrest, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+chicago_map <- chicago_tracts |>
+  left_join(chicago_merged_agg, by = "geoid10")
+
+
+library(patchwork)
+
+# Map 1: Homicide Count
+p1 <- ggplot(chicago_map) +
+  geom_sf(aes(fill = count), color = "white", linewidth = 0.1) +
+  scale_fill_gradient(
+    low = "#102A43",
+    high = "#56B1F7",
+    na.value = "white"
+  ) +
+  labs(
+    title = "Homicide Count",
+    fill = "Count"
+  ) +
+  theme_void()
+
+# Map 2: Arrest Rate
+p2 <- ggplot(chicago_map) +
+  geom_sf(aes(fill = arrest_rate), color = "white", linewidth = 0.1) +
+  scale_fill_gradient(
+    low = "#102A43",
+    high = "#56B1F7",
+    limits = c(0, 1),
+    na.value = "white"
+  ) +
+  labs(
+    title = "Homicide Arrest Rate",
+    fill = "Arrest Rate"
+  ) +
+  theme_void()
+
+p1 + p2
+
+### Interpretation of Homicide Distribution
+###The two maps show that homicides are not evenly distributed across Chicago census tracts. Among the 599 census tracts with at least one recorded homicide, the number of incidents ranges from 1 to 47, with a median of 4. The arrest rate also varies across census tracts, with a median of approximately 35.3%. These patterns suggest differences in the geographic distribution of homicides and recorded arrests. However, the maps are descriptive and do not explain what causes these differences. In addition, homicide counts are not adjusted for population size, so areas with higher counts do not necessarily have higher homicide risks.
+
 ```
 
-The `echo: false` option disables the printing of code (only output is displayed).
+## 5. Using the Census API (2.5 Points)
+```{r}
+library(tidycensus)
+library(tidyverse)
+
+acs_vars <- c(
+  median_income = "B19013_001",
+  bachelors = "B15003_022",
+  below_poverty = "B17001_002"
+)
+
+acs_tidy <- get_acs(
+  geography = "tract",
+  variables = acs_vars,
+  state = "IL",
+  county = "Cook",
+  year = 2019,
+  survey = "acs5",
+  output = "wide"
+)
+glimpse(acs_tidy)
+```
+
+```{r}
+library(httr)
+library(jsonlite)
+
+api_url <- paste0(
+  "https://api.census.gov/data/2019/acs/acs5",
+  "?get=NAME,B19013_001E,B15003_022E,B17001_002E",
+  "&for=tract:*",
+  "&in=state:17%20county:031"
+)
+
+response <- GET(
+  api_url,
+  query = list(
+    key = Sys.getenv("CENSUS_API_KEY")
+  )
+)
+
+httr::stop_for_status(response)
+
+response_text <- httr::content(
+  response,
+  as = "text",
+  encoding = "UTF-8"
+)
+
+api_json <- jsonlite::fromJSON(response_text)
+
+colnames(api_json) <- api_json[1, ]
+
+acs_api <- as_tibble(
+  api_json[-1, , drop = FALSE]
+)
+
+glimpse(acs_api)
+
+nrow(acs_api)
+```
+
+```{r}
+library(testthat)
+
+test_that("Both methods return the same number of rows", {
+  
+  expect_equal(
+    nrow(acs_tidy),
+    nrow(acs_api)
+  )
+  
+})
+```
+
+# Stretch Part 1: Identifying Crimes Near Transit Stations (3 points)
+
+```{r}
+library(sf)
+library(tidyverse)
+
+stations <- st_read("data/CTA_RailStations.shp")
+```
+
+```{r}
+chicago_gdf <- chicago_tracts
+
+stations <- stations |>
+  st_transform(st_crs(chicago_gdf))
+
+ggplot() +
+  geom_sf(data = chicago_gdf, fill = "grey90", color = "white") +
+  geom_sf(data = stations, color = "red", size = 1) +
+  labs(title = "CTA 'L' Stations in Chicago") +
+  theme_void()
+```
+
+```{r}
+stations_filtered <- stations |>
+  st_join(
+    chicago_gdf,
+    join = st_intersects,
+    left = FALSE
+  ) |>
+  distinct(STATION_ID, .keep_all = TRUE)
+```
+
+```{r}
+nrow(stations)
+
+nrow(stations_filtered)
+```
+
+```{r}
+ggplot() +
+  geom_sf(data = chicago_gdf, fill = "grey90", color = "white") +
+  geom_sf(data = stations_filtered, color = "blue", size = 1) +
+  labs(title = "CTA 'L' Stations Within Chicago") +
+  theme_void()
+```
+
+```{r}
+stations_m <- stations_filtered |>
+  st_transform(26916)
+
+crimes_m <- crimes_sf |>
+  st_transform(26916)
+
+
+stations_buffer <- stations_m |>
+  st_buffer(dist = 400)
+
+crimes_near_stations <- crimes_m |>
+  st_join(
+    stations_buffer |> select(STATION_ID, LONGNAME),
+    join = st_intersects,
+    left = FALSE
+  )
+
+station_counts <- crimes_near_stations |>
+  st_drop_geometry() |>
+  count(
+    STATION_ID,
+    LONGNAME,
+    name = "homicide_count"
+  ) |>
+  arrange(desc(homicide_count))
+
+head(station_counts, 10)
+```
+
+Pulaski-Congress Station had the highest number of homicides within 400 meters, with 34 incidents during the study period. King Drive and Laramie followed with 28 and 27 incidents, respectively.
+
+## Stretch Part 2: Iterating API pulls and map creation using purrr (2 points)
+###1. Create and document a custom ACS mapping function
+
+```{r}
+library(tidycensus)
+library(tidyverse)
+library(sf)
+```
+
+```{r}
+
+#' Create a Census Tract Choropleth Map
+#'
+#' @param year Numeric. ACS data year.
+#' @param variable_code Character. Census variable code.
+#' @param variable_name Character. Human-readable variable name.
+#' @param state_fips Character. State FIPS code.
+#' @param county_fips Character. County FIPS code.
+#' @return A ggplot choropleth map.
+make_acs_map <- function(year, variable_code, variable_name,
+                         state_fips, county_fips) {
+
+  acs_data <- get_acs(
+    geography = "tract",
+    variables = c(indicator = variable_code),
+    state = state_fips,
+    county = county_fips,
+    year = year,
+    survey = "acs5",
+    geometry = TRUE,
+    output = "wide"
+  )
+
+  acs_data <- acs_data |>
+    rename(value = indicatorE)
+
+  map <- ggplot(acs_data) +
+    geom_sf(aes(fill = value), color = "white", linewidth = 0.1) +
+    scale_fill_viridis_c(na.value = "grey90") +
+    labs(
+      title = paste(variable_name, "by Census Tract"),
+      subtitle = paste("ACS 5-Year Estimates,", year),
+      fill = variable_name
+    ) +
+    theme_void()
+
+  return(map)
+}
+```
+
+```{r}
+make_acs_map(
+  year = 2019,
+  variable_code = "B19013_001",
+  variable_name = "Median Household Income",
+  state_fips = "17",
+  county_fips = "031"
+)
+```
+
+### 2. Add a human-readable location to the map title
+
+```{r}
+#' Create a Census Tract Choropleth Map
+#'
+#' @param year Numeric. ACS data year.
+#' @param variable_code Character. Census variable code.
+#' @param variable_name Character. Human-readable variable name.
+#' @param state_fips Character. State FIPS code.
+#' @param county_fips Character. County FIPS code.
+#' @return A ggplot choropleth map.
+
+make_acs_map <- function(year, variable_code, variable_name,
+                         state_fips, county_fips) {
+
+
+  acs_data <- get_acs(
+    geography = "tract",
+    variables = c(indicator = variable_code),
+    state = state_fips,
+    county = county_fips,
+    year = year,
+    survey = "acs5",
+    geometry = TRUE,
+    output = "wide"
+  )
+
+  acs_data <- acs_data |>
+    rename(value = indicatorE)
+
+  location <- acs_data$NAME[1] |>
+    str_remove("^[^,]+,\\s*")
+
+
+  map <- ggplot(acs_data) +
+    geom_sf(aes(fill = value), color = "white", linewidth = 0.1) +
+    scale_fill_viridis_c(na.value = "grey90") +
+    labs(
+      title = paste(variable_name, "by Tract in", location),
+      subtitle = paste("ACS 5-Year Estimates,", year),
+      fill = variable_name
+    ) +
+    theme_void()
+
+  return(map)
+}
+```
+
+```{r}
+make_acs_map(
+  year = 2019,
+  variable_code = "B19013_001",
+  variable_name = "Median Household Income",
+  state_fips = "17",
+  county_fips = "031"
+)
+```
+
+### 3. Save maps to the images directory
+
+```{r}
+#' Create and Save a Census Tract Choropleth Map
+#'
+#' @param year Numeric. ACS data year.
+#' @param variable_code Character. Census variable code.
+#' @param variable_name Character. Human-readable variable name.
+#' @param state_fips Character. State FIPS code.
+#' @param county_fips Character. County FIPS code.
+#' @return Saves a PNG map in the images directory.
+
+make_acs_map <- function(year, variable_code, variable_name,
+                         state_fips, county_fips) {
+
+  acs_data <- get_acs(
+    geography = "tract",
+    variables = c(indicator = variable_code),
+    state = state_fips,
+    county = county_fips,
+    year = year,
+    survey = "acs5",
+    geometry = TRUE,
+    output = "wide"
+  )
+
+
+  acs_data <- acs_data |>
+    rename(value = indicatorE)
+
+
+  location <- acs_data$NAME[1] |>
+    str_remove("^[^,]+,\\s*")
+
+ 
+  map <- ggplot(acs_data) +
+    geom_sf(aes(fill = value), color = "white", linewidth = 0.1) +
+    scale_fill_viridis_c(na.value = "grey90") +
+    labs(
+      title = paste(variable_name, "by Tract in", location),
+      subtitle = paste("ACS 5-Year Estimates,", year),
+      fill = variable_name
+    ) +
+    theme_void()
+
+
+  dir.create("images", showWarnings = FALSE)
+
+
+  file_name <- paste0(
+    year, "_",
+    state_fips, "_",
+    county_fips, "_",
+    variable_code, ".png"
+  )
+
+  ggsave(
+    filename = file.path("images", file_name),
+    plot = map,
+    width = 10,
+    height = 7,
+    dpi = 300
+  )
+}
+```
+
+### 4. Iterate over five map requests using purrr
+```{r}
+library(purrr)
+library(tidyverse)
+
+map_requests <- tibble(
+  year = c(2019, 2019, 2021, 2022, 2023),
+
+  variable_code = c(
+    "B19013_001",
+    "B15003_022",
+    "B17001_002",
+    "B01003_001",
+    "B25077_001"
+  ),
+
+  variable_name = c(
+    "Median Household Income",
+    "Bachelor's Degree Population",
+    "Population Below Poverty Line",
+    "Total Population",
+    "Median Home Value"
+  ),
+
+  state_fips = c("17", "11", "06", "42", "53"),
+
+  county_fips = c("031", "001", "075", "101", "033")
+)
+
+map_requests
+```
+
+```{r}
+library(tidyverse)
+library(sf)
+library(tidycensus)
+library(purrr)
+
+#| message: false
+#| warning: false
+#| results: hide
+pwalk(
+  map_requests,
+  make_acs_map
+)
+```
+
+
+
+
+
+
+
+
+
+
+
